@@ -1,222 +1,54 @@
 package Linux::Statm::Tiny;
 
-use v5.10.1;
+use v5.10;
+use strict;
+use warnings;
 
-use Moo;
-use MooX::Aliases;
+use POSIX ();
 
-use Fcntl qw/ O_RDONLY /;
-use POSIX qw/ ceil /;
-use Types::Standard qw/ ArrayRef Int /;
+use constant page_size =>
+    do { no warnings 'numeric'; 0 + `getconf PAGE_SIZE` } || 4096;
 
-our $VERSION = '0.0602';
+my @stats = qw/size resident share text lib data dt/;
 
-# ABSTRACT: simple access to Linux /proc/../statm
+sub new {
+    my ( $class, $pid ) = @_;
 
-=head1 SYNOPSIS
+    return bless( { pid => $pid // $$ }, $class )->refresh;
+}
 
-  use Linux::Statm::Tiny;
+sub pid { return shift->{pid} }
 
-  my $stats = Linux::Statm::Tiny->new( pid => $$ );
+sub refresh {
+    my $self = shift;
 
-  my $size = $stats->size;
+    open my $fh, '<', "/proc/$self->{pid}/statm"
+        or die "Unable to open /proc/$self->{pid}/statm: $!";
 
-=head1 DESCRIPTION
+    @$self{@stats} = split ' ', scalar <$fh>;
 
-This class returns the Linux memory stats from F</proc/$pid/statm>.
+    return $self;
+}
 
-=for readme stop
+sub statm { return [ shift->@{@stats} ] }
 
-=head1 ATTRIBUTES
+my %methods = ( rss => 'resident', vsz => 'size' );
+@methods{@stats} = @stats;
 
-=head2 C<pid>
+my %suffixes = (
+    ''      => 1,
+    _pages  => 1,
+    _bytes  => page_size,
+    _kb     => page_size / 1024,
+    _mb     => page_size / 1048576,
+);
 
-The PID to obtain stats for. If omitted, it uses the current PID from
-C<$$>.
+while ( my ( $method, $stat ) = each %methods ) {
+    while ( my ( $suffix, $factor ) = each %suffixes ) {
+        no strict 'refs';
 
-=cut
-
-has pid => (
-    is      => 'lazy',
-    isa     => Int,
-    default => sub { $$ },
-    );
-
-=head2 C<page_size>
-
-The page size.
-
-=cut
-
-my $PageSize;
-
-has page_size => (
-    is      => 'lazy',
-    isa     => Int,
-    default => sub {
-        $PageSize //= `getconf PAGE_SIZE`
-            or die "Unable to run getconf PAGE_SIZE: $!";
-        $PageSize += 0;
-        },
-    init_arg => undef,
-    );
-
-=head2 C<statm>
-
-The raw array reference of values.
-
-=cut
-
-has statm => (
-    is       => 'lazy',
-    isa      => ArrayRef[Int],
-    writer   => 'refresh',
-    init_arg => undef,
-    );
-
-sub _build_statm {
-    my ($self) = @_;
-    my $pid = $self->pid;
-    sysopen( my $fh, "/proc/${pid}/statm", O_RDONLY )
-        or die "Unable to open /proc/${pid}/statm: $!";
-    chomp(my $raw = <$fh>);
-    close $fh;
-    [ split / /, $raw ];
+        *{ $method . $suffix } = sub { POSIX::ceil shift->{$stat} * $factor };
     }
-
-=head2 C<size>
-
-Total program size, in pages.
-
-=head2 C<vsz>
-
-An alias for L</size>.
-
-=head2 C<resident>
-
-Resident set size (RSS), in pages.
-
-=head2 C<rss>
-
-An alias for L</resident>.
-
-=head2 C<share>
-
-Shared pages.
-
-=head2 C<text>
-
-Text (code).
-
-=head2 C<lib>
-
-Library (unused in Linux 2.6).
-
-=head2 C<data>
-
-Data + Stack.
-
-=head2 C<dt>
-
-Dirty pages (unused in Linux 2.6).
-
-=cut
-
-my %stats = (
-    size     => 0,
-    resident => 1,
-    share    => 2,
-    text     => 3,
-    lib      => 4,
-    data     => 5,
-    dt       => 6,
-    );
-
-my %aliases = (
-    size     => 'vsz',
-    resident => 'rss',
-    );
-
-my %alts = (       # page_size multipliers
-    bytes    => 1,
-    kb       => 1024,
-    mb       => 1048576,
-    );
-
-my @attrs;
-
-foreach my $attr (keys %stats) {
-
-    my @aliases = ( "${attr}_pages" );
-    push @aliases, ( $aliases{$attr}, $aliases{$attr} . '_pages' )
-        if $aliases{$attr};
-
-    has $attr => (
-        is       => 'lazy',
-        isa      => Int,
-        default  => sub { shift->statm->[$stats{$attr}] },
-        init_arg => undef,
-        alias    => \@aliases,
-        clearer  => "_refresh_${attr}",
-        );
-
-    push @attrs, $attr;
-
-    foreach my $alt (keys %alts) {
-        has "${attr}_${alt}" => (
-            is       => 'lazy',
-            isa      => Int,
-            default  => sub { my $self = shift;
-                              ceil($self->$attr * $self->page_size / $alts{$alt});
-                              },
-            init_arg => undef,
-            clearer  => "_refresh_${attr}_${alt}",
-            $aliases{$attr} ? ( alias => $aliases{$attr} . "_${alt}" ) : ( ),
-            );
-
-        push @attrs, "${attr}_${alt}";
-        }
-
-    }
-
-around refresh => sub {
-    my ($next, $self) = @_;
-    $self->$next( $self->_build_statm );
-    foreach my $attr (@attrs) {
-        my $meth = "_refresh_${attr}";
-        $self->$meth;
-        }
-    };
-
-
-=head1 ALIASES
-
-You can append the "_pages" suffix to attributes to make it explicit
-that the return value is in pages, e.g. C<vsz_pages>.
-
-You can also use the "_bytes", "_kb" or "_mb" suffixes to get the
-values in bytes, kilobytes or megabytes, e.g. C<size_bytes>, C<size_kb>
-and C<size_mb>.
-
-The fractional kilobyte and megabyte sizes will be rounded up, e.g.
-if the L</size> is 1.04 MB, then C<size_mb> will return "2".
-
-=head1 METHODS
-
-=head2 C<refresh>
-
-The values do not change dynamically. If you need to refresh the
-values, then you you must either create a new instance of the object,
-or use the C<refresh> method:
-
-  $stats->refresh;
-
-=head1 SEE ALSO
-
-L<proc(5)>.
-
-=cut
-
-use namespace::autoclean 0.16;
+}
 
 1;
